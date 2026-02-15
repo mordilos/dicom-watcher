@@ -1,0 +1,16 @@
+services:
+  dicom-watcher:
+    container_name: dicom-watcher-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./dcm-images:/mnt/dcm-files
+    environment:
+      - DIRECTORY_PATH=/mnt/smb/share
+      - API_URL=http://example.com/api/studies
+      - TIMEOUT=30
+      - POLL_INTERVAL=60
+      - BATCH_SIZE=100
+    restart: unless-stopped
