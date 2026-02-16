@@ -1,6 +1,7 @@
 services:
   dicom-watcher:
     container_name: dicom-watcher-app
+    image: dicom-watcher-image
     build:
       context: .
       dockerfile: Dockerfile

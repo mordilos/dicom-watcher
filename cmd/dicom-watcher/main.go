@@ -13,7 +13,7 @@ import (
 func main() {
 	// Read the configuration file
 	log.Print("Reading config...")
-	config, err := config.ReadConfig("config.yaml")
+	config, err := config.ReadConfig("/app/config.yaml")
 	if err != nil {
 		log.Fatal(err)
 	}
