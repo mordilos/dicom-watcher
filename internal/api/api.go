@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 )
 
-func NotifyStudyReady(apiUrl, studyID string) error {
+func NotifyStudyReady(apiUrl, tenantID, studyID, model string) error {
 	payload := map[string]string{
-		"study_id": studyID,
+		"tenant": tenantID,
+		"study":  studyID,
+		"model":  model,
 	}
 
 	jsonPayload, err := json.Marshal(payload)
@@ -25,7 +28,10 @@ func NotifyStudyReady(apiUrl, studyID string) error {
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("API request failed with status code: %d", resp.StatusCode)
+		log.Printf("API request failed with status code: %d", resp.StatusCode)
 	}
+
+	log.Printf("Notification for tenant: %s - study: %s sent!", tenantID, studyID)
 
 	return nil
 }

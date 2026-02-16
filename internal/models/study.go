@@ -2,6 +2,11 @@ package models
 
 import "time"
 
+type Tenant struct {
+	ID    string
+	Study map[string]*Study
+}
+
 type Study struct {
 	ID     string
 	Series map[string]*Series

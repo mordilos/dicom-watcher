@@ -15,27 +15,27 @@ import (
 )
 
 type Watcher struct {
-	Config       *config.Config
-	Studies      map[string]*models.Study
-	LastEvent    time.Time
-	Timeout      time.Duration
-	PollInterval time.Duration
-	BatchSize    int
-	FileMetadata map[string]time.Time
-	Mutex        sync.Mutex
-	StudyTimers  map[string]*time.Timer
+	Config        *config.Config
+	TenantStudies map[string]map[string]*models.Study
+	LastEvent     time.Time
+	Timeout       time.Duration
+	PollInterval  time.Duration
+	BatchSize     int
+	FileMetadata  map[string]time.Time
+	Mutex         sync.Mutex
+	StudyTimers   map[string]*time.Timer
 }
 
 func NewWatcher(config *config.Config) (*Watcher, error) {
 	return &Watcher{
-		Config:       config,
-		Studies:      make(map[string]*models.Study),
-		LastEvent:    time.Now(),
-		Timeout:      time.Duration(config.Timeout) * time.Second,
-		PollInterval: time.Duration(config.PollInterval) * time.Second,
-		BatchSize:    config.BatchSize,
-		FileMetadata: make(map[string]time.Time),
-		StudyTimers:  make(map[string]*time.Timer),
+		Config:        config,
+		TenantStudies: make(map[string]map[string]*models.Study),
+		LastEvent:     time.Now(),
+		Timeout:       time.Duration(config.Timeout) * time.Second,
+		PollInterval:  time.Duration(config.PollInterval) * time.Second,
+		BatchSize:     config.BatchSize,
+		FileMetadata:  make(map[string]time.Time),
+		StudyTimers:   make(map[string]*time.Timer),
 	}, nil
 }
 
@@ -60,29 +60,13 @@ func (w *Watcher) CheckDirectory() {
 	// Create a wait group to wait for all goroutines to finish
 	var wg sync.WaitGroup
 
-	// Start a goroutine to walk the directory and send file paths to the channel
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		err := filepath.Walk(w.Config.DirectoryPath, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				errChan <- err
-				return err
-			}
-			if !info.IsDir() {
-				fileChan <- path
-			}
-			return nil
-		})
-		if err != nil {
-			errChan <- err
+		for err := range errChan {
+			log.Println("error:", err)
 		}
-		close(fileChan)
-		close(errChan)
 	}()
 
-	// Start a pool of goroutines to process files from the channel
-	numWorkers := runtime.NumCPU() * 2 // Adjust the number of workers based on the number of CPU cores
+	numWorkers := runtime.NumCPU() * 2
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
@@ -93,95 +77,117 @@ func (w *Watcher) CheckDirectory() {
 					errChan <- err
 					continue
 				}
-				if lastModified, ok := w.FileMetadata[filePath]; !ok || lastModified.Before(info.ModTime()) {
-					w.ProcessFile(filePath, info.ModTime())
+
+				// LOCK: Protect FileMetadata and LastEvent
+				w.Mutex.Lock()
+				lastModified, ok := w.FileMetadata[filePath]
+				needsProcessing := !ok || lastModified.Before(info.ModTime())
+
+				if needsProcessing {
+					// We process while holding the lock because ProcessFile
+					// also manipulates shared maps
+					w.processFileLocked(filePath, info.ModTime())
 					w.FileMetadata[filePath] = info.ModTime()
 					w.LastEvent = time.Now()
 				}
+				w.Mutex.Unlock()
 			}
 		}()
 	}
 
-	// Start a goroutine to handle errors from the error channel
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for err := range errChan {
-			log.Println("error:", err)
+	err := filepath.Walk(w.Config.DirectoryPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
-	}()
+		if !info.IsDir() {
+			fileChan <- path
+		}
+		return nil
+	})
 
-	// Wait for all goroutines to finish
-	wg.Wait()
+	if err != nil {
+		errChan <- err
+	}
+
+	// 4. Cleanup
+	close(fileChan) // Signal workers to stop
+	wg.Wait()       // Wait for workers to finish
+	close(errChan)  // Now safe to close error channel
 }
 
-func (w *Watcher) ProcessFile(filePath string, lastModified time.Time) {
-	log.Println("Processing file:", filePath)
-
+func (w *Watcher) processFileLocked(filePath string, lastModified time.Time) {
 	// Check if the file has a .dcm extension
-	if filepath.Ext(filePath) != ".dcm" && filepath.Ext(filePath) != ".dcm.gz" {
+	ext := filepath.Ext(filePath)
+	if ext != ".dcm" && !strings.HasSuffix(filePath, ".dcm.gz") {
 		return
 	}
 
-	// Extract study and series IDs from the file path
-	studyID, seriesID, dicomID := extractIDs(filePath)
+	tenantID, studyID, seriesID, dicomID := extractIDs(filePath)
+	model := "medclip"
 
-	// Lock the mutex before accessing the Studies map
-	w.Mutex.Lock()
-	defer w.Mutex.Unlock()
+	if _, ok := w.TenantStudies[tenantID]; !ok {
+		w.TenantStudies[tenantID] = make(map[string]*models.Study)
+	}
 
-	// Update the study structure
-	if _, ok := w.Studies[studyID]; !ok {
-		w.Studies[studyID] = &models.Study{
+	if _, ok := w.TenantStudies[tenantID][studyID]; !ok {
+		w.TenantStudies[tenantID][studyID] = &models.Study{
 			ID:     studyID,
 			Series: make(map[string]*models.Series),
 			Ready:  false,
 		}
-		// Start a timer for the study
+
+		// Capture vars for closure
+		tID, sID := tenantID, studyID
 		w.StudyTimers[studyID] = time.AfterFunc(w.Timeout, func() {
-			w.CheckStudyReady(studyID)
+			w.CheckStudyReady(tID, sID, model)
 		})
 	} else {
-		// Reset the timer for the study
 		if timer, ok := w.StudyTimers[studyID]; ok {
 			timer.Reset(w.Timeout)
 		}
 	}
 
-	if _, ok := w.Studies[studyID].Series[seriesID]; !ok {
-		w.Studies[studyID].Series[seriesID] = &models.Series{
+	if _, ok := w.TenantStudies[tenantID][studyID].Series[seriesID]; !ok {
+		w.TenantStudies[tenantID][studyID].Series[seriesID] = &models.Series{
 			ID:         seriesID,
 			DicomFiles: make(map[string]*models.DicomFile),
 		}
 	}
 
-	w.Studies[studyID].Series[seriesID].DicomFiles[dicomID] = &models.DicomFile{
+	w.TenantStudies[tenantID][studyID].Series[seriesID].DicomFiles[dicomID] = &models.DicomFile{
 		ID:           dicomID,
 		FilePath:     filePath,
 		LastModified: lastModified,
 	}
 }
 
-func (w *Watcher) CheckStudyReady(studyID string) {
-	// Lock the mutex before accessing the Studies map
+func (w *Watcher) CheckStudyReady(tenantID, studyID, model string) {
 	w.Mutex.Lock()
 	defer w.Mutex.Unlock()
 
-	if study, ok := w.Studies[studyID]; ok && !study.Ready {
+	if study, ok := w.TenantStudies[tenantID][studyID]; ok && !study.Ready {
 		study.Ready = true
+		log.Printf("tenant: %s - study: %s stabilized...", tenantID, studyID)
 
-		log.Println("study ready:", studyID)
-		// Notify the API that the study is ready
-		go api.NotifyStudyReady(w.Config.ApiUrl, study.ID)
+		// Clean up timer map to prevent memory leak
+		delete(w.StudyTimers, studyID)
+
+		// Trigger API call in goroutine so we don't hold the lock during network I/O
+		go api.NotifyStudyReady(w.Config.ApiUrl, tenantID, studyID, model)
 	}
 }
 
-func extractIDs(filePath string) (studyID, seriesID, dicomID string) {
-	// Extract study, series, and DICOM file IDs from the file path
-	// Example: /directory/study123/series456/dicom789.dcm
-	parts := strings.Split(filePath, "/")
+func extractIDs(filePath string) (tenantID, studyID, seriesID, dicomID string) {
+	// Use filepath.ToSlash to handle Windows/Linux path differences
+	parts := strings.Split(filepath.ToSlash(filePath), "/")
+
+	if len(parts) < 4 {
+		return "unknown", "unknown", "unknown", filepath.Base(filePath)
+	}
+
+	tenantID = parts[len(parts)-4]
 	studyID = parts[len(parts)-3]
 	seriesID = parts[len(parts)-2]
 	dicomID = filepath.Base(parts[len(parts)-1])
-	return studyID, seriesID, dicomID
+	return tenantID, studyID, seriesID, dicomID
 }
