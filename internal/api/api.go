@@ -27,8 +27,8 @@ func NotifyStudyReady(apiUrl, tenantID, studyID, model string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("API request failed with status code: %d", resp.StatusCode)
 		log.Printf("API request failed with status code: %d", resp.StatusCode)
+		return fmt.Errorf("API request failed with status code: %d", resp.StatusCode)
 	}
 
 	log.Printf("Notification for tenant: %s - study: %s sent!", tenantID, studyID)

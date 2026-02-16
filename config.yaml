@@ -1,5 +1,0 @@
-directory_path: "/mnt/dcm-files"
-api_url: "http://example.com/api/studies"
-timeout: 30
-poll_interval: 60
-batch_size: 100
